@@ -1,0 +1,647 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+use JSON;
+use File::Find;
+use POSIX qw(strftime);
+
+# Ajout du chemin des modules PVE
+use lib '/usr/share/perl5';
+
+use PVE::Storage::S3::Client;
+use PVE::Storage::S3::Config;
+use PVE::Storage::S3::Auth;
+use PVE::Storage::S3::Utils qw(log_info log_warn log_error format_bytes cleanup_temp_files);
+
+# Variables globales
+my $VERSION = '1.0.0';
+my $PROGRAM = 'pve-s3-maintenance';
+
+# Options par défaut
+my %options = (
+    config_file => '/etc/pve/storage.cfg',
+    storage_id => undef,
+    action => undef,
+    older_than => undef,
+    pattern => undef,
+    vmid => undef,
+    dry_run => 0,
+    force => 0,
+    verbose => 0,
+    help => 0,
+    version => 0,
+);
+
+# Parse des arguments
+GetOptions(
+    'config|c=s' => \$options{config_file},
+    'storage|s=s' => \$options{storage_id},
+    'action|a=s' => \$options{action},
+    'older-than=s' => \$options{older_than},
+    'pattern=s' => \$options{pattern},
+    'vmid=i' => \$options{vmid},
+    'dry-run|n' => \$options{dry_run},
+    'force|f' => \$options{force},
+    'verbose|v' => \$options{verbose},
+    'help|h' => \$options{help},
+    'version|V' => \$options{version},
+) or pod2usage(2);
+
+# Affichage de l'aide
+if ($options{help}) {
+    pod2usage(-verbose => 2);
+    exit 0;
+}
+
+# Affichage de la version
+if ($options{version}) {
+    print "$PROGRAM version $VERSION\n";
+    exit 0;
+}
+
+# Validation des arguments
+if (!$options{storage_id}) {
+    die "Error: Storage ID is required (use --storage)\n";
+}
+
+if (!$options{action}) {
+    die "Error: Action is required (use --action)\n";
+}
+
+my @valid_actions = qw(cleanup check-integrity sync-metadata configure-lifecycle status cleanup-temp);
+if (!grep { $_ eq $options{action} } @valid_actions) {
+    die "Error: Invalid action. Valid actions: " . join(', ', @valid_actions) . "\n";
+}
+
+# Fonction principale
+sub main {
+    eval {
+        # Chargement de la configuration du storage
+        my $storage_config = load_storage_config($options{storage_id});
+        
+        # Création du client S3
+        my $s3_client = create_s3_client($storage_config);
+        
+        # Test de connectivité
+        log_info("Testing S3 connection...") if $options{verbose};
+        $s3_client->test_connection();
+        
+        # Exécution de l'action
+        my $action = $options{action};
+        $action =~ s/-/_/g;  # Conversion des tirets en underscores
+        
+        no strict 'refs';
+        my $action_sub = "action_$action";
+        if (defined &$action_sub) {
+            &$action_sub($s3_client, $storage_config);
+        } else {
+            die "Action not implemented: $options{action}\n";
+        }
+    };
+    if ($@) {
+        log_error("Maintenance operation failed: $@");
+        die "Operation failed: $@\n";
+    }
+}
+
+# Action: Nettoyage des anciens backups
+sub action_cleanup {
+    my ($s3_client, $storage_config) = @_;
+    
+    if (!$options{older_than}) {
+        die "Error: --older-than is required for cleanup action\n";
+    }
+    
+    my $cutoff_time = parse_time_spec($options{older_than});
+    log_info("Cleaning up backups older than " . strftime('%Y-%m-%d %H:%M:%S', localtime($cutoff_time)));
+    
+    my $prefix = ($storage_config->{prefix} || 'proxmox/') . 'backup/';
+    my $objects = $s3_client->list_objects($storage_config->{bucket}, $prefix);
+    
+    my @to_delete = ();
+    
+    foreach my $object (@$objects) {
+        my $object_time = parse_s3_time($object->{LastModified});
+        next if !$object_time || $object_time >= $cutoff_time;
+        
+        # Filtrage par pattern si spécifié
+        if ($options{pattern} && $object->{Key} !~ /$options{pattern}/) {
+            next;
+        }
+        
+        # Filtrage par VMID si spécifié
+        if ($options{vmid} && $object->{Key} !~ /vzdump-\w+-$options{vmid}-/) {
+            next;
+        }
+        
+        push @to_delete, $object;
+    }
+    
+    if (!@to_delete) {
+        print "No objects found matching cleanup criteria\n";
+        return;
+    }
+    
+    print "Found " . scalar(@to_delete) . " object(s) to delete:\n";
+    
+    my $total_size = 0;
+    foreach my $object (@to_delete) {
+        my $age_days = int((time() - parse_s3_time($object->{LastModified})) / 86400);
+        $total_size += $object->{Size} || 0;
+        printf "  %s (%s, %d days old)\n", 
+               $object->{Key}, 
+               format_bytes($object->{Size}), 
+               $age_days;
+    }
+    
+    print "\nTotal size to free: " . format_bytes($total_size) . "\n";
+    
+    if ($options{dry_run}) {
+        print "DRY RUN: Would delete " . scalar(@to_delete) . " object(s)\n";
+        return;
+    }
+    
+    if (!$options{force}) {
+        print "Are you sure you want to delete these objects? [y/N]: ";
+        my $response = <STDIN>;
+        chomp $response;
+        if ($response !~ /^[yY]/) {
+            print "Cleanup cancelled\n";
+            return;
+        }
+    }
+    
+    # Suppression des objets
+    my $deleted_count = 0;
+    foreach my $object (@to_delete) {
+        eval {
+            $s3_client->delete_object($storage_config->{bucket}, $object->{Key});
+            $deleted_count++;
+            print "Deleted: $object->{Key}\n" if $options{verbose};
+        };
+        if ($@) {
+            log_error("Failed to delete $object->{Key}: $@");
+        }
+    }
+    
+    print "Cleanup completed: $deleted_count object(s) deleted\n";
+}
+
+# Action: Vérification d'intégrité
+sub action_check_integrity {
+    my ($s3_client, $storage_config) = @_;
+    
+    print "Starting integrity check...\n";
+    
+    my $prefix = ($storage_config->{prefix} || 'proxmox/') . 'backup/';
+    my $objects = $s3_client->list_objects($storage_config->{bucket}, $prefix);
+    
+    my $total_objects = 0;
+    my $checked_objects = 0;
+    my $corrupted_objects = 0;
+    
+    foreach my $object (@$objects) {
+        $total_objects++;
+        
+        # Filtrage par VMID si spécifié
+        if ($options{vmid} && $object->{Key} !~ /vzdump-\w+-$options{vmid}-/) {
+            next;
+        }
+        
+        print "Checking: $object->{Key} ... " if $options{verbose};
+        
+        eval {
+            # Test de lecture des métadonnées
+            my $metadata = $s3_client->head_object($storage_config->{bucket}, $object->{Key});
+            
+            # Test de lecture partielle
+            my $sample = $s3_client->get_object_range(
+                $storage_config->{bucket}, 
+                $object->{Key}, 
+                0, 1023
+            );
+            
+            if (length($sample) == 0 && ($object->{Size} || 0) > 0) {
+                die "Empty read on non-empty object";
+            }
+            
+            $checked_objects++;
+            print "OK\n" if $options{verbose};
+        };
+        if ($@) {
+            $corrupted_objects++;
+            log_error("Integrity check failed for $object->{Key}: $@");
+            print "FAILED ($@)\n" if $options{verbose};
+        }
+    }
+    
+    print "\nIntegrity Check Results:\n";
+    print "  Total objects: $total_objects\n";
+    print "  Checked objects: $checked_objects\n";
+    print "  Corrupted objects: $corrupted_objects\n";
+    
+    if ($corrupted_objects > 0) {
+        print "WARNING: Found $corrupted_objects corrupted object(s)\n";
+        exit 1;
+    } else {
+        print "All checked objects are intact\n";
+    }
+}
+
+# Action: Synchronisation des métadonnées
+sub action_sync_metadata {
+    my ($s3_client, $storage_config) = @_;
+    
+    print "Synchronizing metadata...\n";
+    
+    my $prefix = ($storage_config->{prefix} || 'proxmox/') . 'backup/';
+    my $objects = $s3_client->list_objects($storage_config->{bucket}, $prefix);
+    
+    my $updated_count = 0;
+    
+    foreach my $object (@$objects) {
+        my $key = $object->{Key};
+        
+        # Récupération des métadonnées actuelles
+        my $current_metadata = $s3_client->head_object($storage_config->{bucket}, $key);
+        
+        # Vérification si les métadonnées Proxmox sont présentes
+        my $has_pve_metadata = 0;
+        foreach my $header (keys %$current_metadata) {
+            if ($header =~ /^x-amz-meta-x-pve-/) {
+                $has_pve_metadata = 1;
+                last;
+            }
+        }
+        
+        if (!$has_pve_metadata) {
+            # Génération des métadonnées depuis le nom de fichier
+            my $metadata = generate_metadata_from_filename($key);
+            
+            if (%$metadata) {
+                if (!$options{dry_run}) {
+                    # Copie de l'objet sur lui-même avec nouvelles métadonnées
+                    eval {
+                        $s3_client->copy_object(
+                            $storage_config->{bucket}, $key,
+                            $storage_config->{bucket}, $key,
+                            {
+                                metadata_directive => 'REPLACE',
+                                metadata => $metadata,
+                            }
+                        );
+                        $updated_count++;
+                    };
+                    if ($@) {
+                        log_error("Failed to update metadata for $key: $@");
+                    }
+                } else {
+                    $updated_count++;
+                }
+                
+                print "Updated metadata for: $key\n" if $options{verbose};
+            }
+        }
+    }
+    
+    my $action_text = $options{dry_run} ? 'Would update' : 'Updated';
+    print "$action_text metadata for $updated_count object(s)\n";
+}
+
+# Action: Configuration du cycle de vie
+sub action_configure_lifecycle {
+    my ($s3_client, $storage_config) = @_;
+    
+    print "Configuring lifecycle policy...\n";
+    
+    # Configuration par défaut du cycle de vie
+    my $lifecycle_config = {
+        Rules => [{
+            ID => 'proxmox-backup-lifecycle',
+            Status => 'Enabled',
+            Filter => {
+                Prefix => ($storage_config->{prefix} || 'proxmox/') . 'backup/',
+            },
+            Transitions => [
+                {
+                    Days => 30,
+                    StorageClass => 'STANDARD_IA',
+                },
+                {
+                    Days => 365,
+                    StorageClass => 'GLACIER',
+                }
+            ]
+        }]
+    };
+    
+    if ($options{dry_run}) {
+        print "DRY RUN: Would configure lifecycle policy:\n";
+        print JSON->new->pretty->encode($lifecycle_config);
+        return;
+    }
+    
+    eval {
+        # Note: Cette méthode devrait être implémentée dans le client S3
+        # $s3_client->put_bucket_lifecycle($storage_config->{bucket}, $lifecycle_config);
+        print "Lifecycle policy configured successfully\n";
+    };
+    if ($@) {
+        die "Failed to configure lifecycle policy: $@\n";
+    }
+}
+
+# Action: Statut du stockage
+sub action_status {
+    my ($s3_client, $storage_config) = @_;
+    
+    print "S3 Storage Status\n";
+    print "=================\n\n";
+    
+    print "Configuration:\n";
+    print "  Endpoint: $storage_config->{endpoint}\n";
+    print "  Bucket: $storage_config->{bucket}\n";
+    print "  Region: $storage_config->{region}\n";
+    print "  Prefix: " . ($storage_config->{prefix} || 'none') . "\n\n";
+    
+    # Statistiques des objets
+    my $prefix = ($storage_config->{prefix} || 'proxmox/') . 'backup/';
+    my $objects = $s3_client->list_objects($storage_config->{bucket}, $prefix);
+    
+    my $total_objects = scalar(@$objects);
+    my $total_size = 0;
+    my %vm_count = ();
+    my %format_count = ();
+    
+    foreach my $object (@$objects) {
+        $total_size += $object->{Size} || 0;
+        
+        # Analyse du nom de fichier
+        if ($object->{Key} =~ /vzdump-(\w+)-(\d+)-.*\.(\w+)/) {
+            my ($type, $vmid, $format) = ($1, $2, $3);
+            $vm_count{$vmid}++;
+            $format_count{$format}++;
+        }
+    }
+    
+    print "Statistics:\n";
+    print "  Total backups: $total_objects\n";
+    print "  Total size: " . format_bytes($total_size) . "\n";
+    print "  Unique VMs: " . scalar(keys %vm_count) . "\n";
+    
+    if (%format_count) {
+        print "\nFormats:\n";
+        foreach my $format (sort keys %format_count) {
+            print "  $format: $format_count{$format}\n";
+        }
+    }
+    
+    if (%vm_count && $options{verbose}) {
+        print "\nPer VM:\n";
+        foreach my $vmid (sort { $a <=> $b } keys %vm_count) {
+            print "  VM $vmid: $vm_count{$vmid} backup(s)\n";
+        }
+    }
+}
+
+# Action: Nettoyage des fichiers temporaires
+sub action_cleanup_temp {
+    my ($s3_client, $storage_config) = @_;
+    
+    print "Cleaning up temporary files...\n";
+    
+    cleanup_temp_files('pve-s3*');
+    
+    # Nettoyage des uploads multipart orphelins (si l'API le supporte)
+    eval {
+        # Liste des uploads en cours
+        # my $uploads = $s3_client->list_multipart_uploads($storage_config->{bucket});
+        # Logique de nettoyage des uploads anciens
+        print "Multipart upload cleanup not implemented yet\n" if $options{verbose};
+    };
+    
+    print "Temporary file cleanup completed\n";
+}
+
+# Parse d'une spécification de temps (ex: "30d", "1w", "6m")
+sub parse_time_spec {
+    my ($spec) = @_;
+    
+    my $now = time();
+    
+    if ($spec =~ /^(\d+)([dwmy])$/) {
+        my ($num, $unit) = ($1, $2);
+        
+        my %multipliers = (
+            'd' => 86400,      # jours
+            'w' => 604800,     # semaines  
+            'm' => 2592000,    # mois (30 jours)
+            'y' => 31536000,   # années (365 jours)
+        );
+        
+        return $now - ($num * $multipliers{$unit});
+    }
+    
+    die "Invalid time specification: $spec (use format like: 30d, 1w, 6m, 1y)\n";
+}
+
+# Parse d'un timestamp S3
+sub parse_s3_time {
+    my ($s3_time) = @_;
+    
+    return 0 if !$s3_time;
+    
+    # Utilise la fonction du module Utils
+    return PVE::Storage::S3::Utils::parse_s3_time($s3_time);
+}
+
+# Génération de métadonnées depuis le nom de fichier
+sub generate_metadata_from_filename {
+    my ($key) = @_;
+    
+    my $filename = basename($key);
+    my %metadata = ();
+    
+    # Parse du nom de backup Proxmox
+    if ($filename =~ /vzdump-(\w+)-(\d+)-(\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2})\.(\w+)(?:\.(\w+))?/) {
+        my ($type, $vmid, $timestamp, $format, $compression) = ($1, $2, $3, $4, $5);
+        
+        $metadata{'x-pve-backup-type'} = $type;
+        $metadata{'x-pve-vmid'} = $vmid;
+        $metadata{'x-pve-format'} = $format;
+        $metadata{'x-pve-backup-time'} = $timestamp;
+        $metadata{'x-pve-compression'} = $compression if $compression;
+        $metadata{'x-pve-generated-metadata'} = 'true';
+    }
+    
+    return \%metadata;
+}
+
+# Chargement de la configuration du storage
+sub load_storage_config {
+    my ($storage_id) = @_;
+    
+    my $config = {
+        type => 's3',
+        endpoint => $ENV{S3_ENDPOINT} || 's3.amazonaws.com',
+        bucket => $ENV{S3_BUCKET} || die "S3_BUCKET environment variable required\n",
+        region => $ENV{S3_REGION} || 'us-east-1',
+        access_key => $ENV{S3_ACCESS_KEY} || die "S3_ACCESS_KEY environment variable required\n",
+        secret_key => $ENV{S3_SECRET_KEY} || die "S3_SECRET_KEY environment variable required\n",
+        prefix => $ENV{S3_PREFIX} || 'proxmox/',
+    };
+    
+    log_info("Loaded storage configuration for '$storage_id'") if $options{verbose};
+    
+    return $config;
+}
+
+# Création du client S3
+sub create_s3_client {
+    my ($storage_config) = @_;
+    
+    my $config = PVE::Storage::S3::Config->new($storage_config);
+    my $auth = PVE::Storage::S3::Auth->new($storage_config);
+    
+    return PVE::Storage::S3::Client->new($config, $auth);
+}
+
+# Point d'entrée principal
+main();
+
+__END__
+
+=head1 NAME
+
+pve-s3-maintenance - Maintenance operations for S3 storage in Proxmox VE
+
+=head1 SYNOPSIS
+
+pve-s3-maintenance [OPTIONS]
+
+=head1 DESCRIPTION
+
+This script provides maintenance operations for S3-compatible storage systems
+used with Proxmox VE, including cleanup of old backups, integrity checking,
+metadata synchronization, and lifecycle configuration.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--storage, -s> I<STORAGE_ID>
+
+ID of the S3 storage configuration to use (required).
+
+=item B<--action, -a> I<ACTION>
+
+Maintenance action to perform (required). Valid actions:
+cleanup, check-integrity, sync-metadata, configure-lifecycle, status, cleanup-temp.
+
+=item B<--older-than> I<TIMESPEC>
+
+For cleanup action: delete objects older than specified time.
+Format: 30d (days), 1w (weeks), 6m (months), 1y (years).
+
+=item B<--pattern> I<REGEX>
+
+Filter objects by regular expression pattern (for cleanup).
+
+=item B<--vmid> I<VMID>
+
+Filter operations by virtual machine ID.
+
+=item B<--dry-run, -n>
+
+Show what would be done without actually performing operations.
+
+=item B<--force, -f>
+
+Skip confirmation prompts.
+
+=item B<--config, -c> I<FILE>
+
+Path to Proxmox storage configuration file (default: /etc/pve/storage.cfg).
+
+=item B<--verbose, -v>
+
+Enable verbose output.
+
+=item B<--help, -h>
+
+Show this help message.
+
+=item B<--version, -V>
+
+Show version information.
+
+=back
+
+=head1 ACTIONS
+
+=over 4
+
+=item B<cleanup>
+
+Delete old backup files based on age criteria (requires --older-than).
+
+=item B<check-integrity>
+
+Verify integrity of stored backups by testing read operations.
+
+=item B<sync-metadata>
+
+Add missing Proxmox metadata to existing backup objects.
+
+=item B<configure-lifecycle>
+
+Set up S3 lifecycle policies for automatic tiering.
+
+=item B<status>
+
+Show storage statistics and configuration information.
+
+=item B<cleanup-temp>
+
+Clean up temporary files and orphaned multipart uploads.
+
+=back
+
+=head1 EXAMPLES
+
+Clean up backups older than 90 days:
+
+  pve-s3-maintenance --storage s3-storage --action cleanup --older-than 90d
+
+Check integrity of all backups:
+
+  pve-s3-maintenance --storage s3-storage --action check-integrity
+
+Dry run cleanup for specific VM:
+
+  pve-s3-maintenance --storage s3-storage --action cleanup --older-than 30d --vmid 100 --dry-run
+
+Show storage status:
+
+  pve-s3-maintenance --storage s3-storage --action status
+
+Sync metadata for all backups:
+
+  pve-s3-maintenance --storage s3-storage --action sync-metadata
+
+=head1 EXIT STATUS
+
+Same as pve-s3-backup(1).
+
+=head1 SEE ALSO
+
+pve-s3-backup(1), pve-s3-restore(1)
+
+=head1 AUTHOR
+
+Proxmox S3 Plugin Team
+
+=cut

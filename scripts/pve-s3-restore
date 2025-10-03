@@ -1,0 +1,449 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+use JSON;
+use File::Basename;
+use File::Path qw(make_path);
+
+# Ajout du chemin des modules PVE
+use lib '/usr/share/perl5';
+
+use PVE::Storage::S3::Client;
+use PVE::Storage::S3::Config;
+use PVE::Storage::S3::Auth;
+use PVE::Storage::S3::Utils qw(log_info log_warn log_error format_bytes);
+
+# Variables globales
+my $VERSION = '1.0.0';
+my $PROGRAM = 'pve-s3-restore';
+
+# Options par défaut
+my %options = (
+    config_file => '/etc/pve/storage.cfg',
+    storage_id => undef,
+    source => undef,
+    destination => undef,
+    vmid => undef,
+    list => 0,
+    info => 0,
+    verify => 0,
+    verbose => 0,
+    force => 0,
+    help => 0,
+    version => 0,
+);
+
+# Parse des arguments
+GetOptions(
+    'config|c=s' => \$options{config_file},
+    'storage|s=s' => \$options{storage_id},
+    'source=s' => \$options{source},
+    'destination|d=s' => \$options{destination},
+    'vmid=i' => \$options{vmid},
+    'list|l' => \$options{list},
+    'info|i' => \$options{info},
+    'verify' => \$options{verify},
+    'verbose|v' => \$options{verbose},
+    'force|f' => \$options{force},
+    'help|h' => \$options{help},
+    'version|V' => \$options{version},
+) or pod2usage(2);
+
+# Affichage de l'aide
+if ($options{help}) {
+    pod2usage(-verbose => 2);
+    exit 0;
+}
+
+# Affichage de la version
+if ($options{version}) {
+    print "$PROGRAM version $VERSION\n";
+    exit 0;
+}
+
+# Validation des arguments
+if (!$options{storage_id}) {
+    die "Error: Storage ID is required (use --storage)\n";
+}
+
+if ($options{list}) {
+    # Mode liste - pas besoin d'autres arguments
+} elsif ($options{info}) {
+    if (!$options{source}) {
+        die "Error: Source backup name is required for --info (use --source)\n";
+    }
+} else {
+    # Mode restore
+    if (!$options{source} || !$options{destination}) {
+        die "Error: Both source and destination are required for restore\n";
+    }
+}
+
+# Fonction principale
+sub main {
+    eval {
+        # Chargement de la configuration du storage
+        my $storage_config = load_storage_config($options{storage_id});
+        
+        # Création du client S3
+        my $s3_client = create_s3_client($storage_config);
+        
+        # Test de connectivité
+        log_info("Testing S3 connection...") if $options{verbose};
+        $s3_client->test_connection();
+        
+        if ($options{list}) {
+            list_backups($s3_client, $storage_config);
+        } elsif ($options{info}) {
+            show_backup_info($s3_client, $storage_config);
+        } else {
+            restore_backup($s3_client, $storage_config);
+        }
+        
+    };
+    if ($@) {
+        log_error("Operation failed: $@");
+        die "Operation failed: $@\n";
+    }
+}
+
+# Liste des backups disponibles
+sub list_backups {
+    my ($s3_client, $storage_config) = @_;
+    
+    log_info("Listing backups...") if $options{verbose};
+    
+    my $prefix = ($storage_config->{prefix} || 'proxmox/') . 'backup/';
+    my $objects = $s3_client->list_objects($storage_config->{bucket}, $prefix);
+    
+    if (!@$objects) {
+        print "No backups found in s3://$storage_config->{bucket}/$prefix\n";
+        return;
+    }
+    
+    # Filtrage par VMID si spécifié
+    if ($options{vmid}) {
+        @$objects = grep { 
+            $_->{Key} =~ /vzdump-\w+-$options{vmid}-/ 
+        } @$objects;
+    }
+    
+    # Tri par date (plus récent en premier)
+    @$objects = sort { 
+        ($b->{LastModified} || '') cmp ($a->{LastModified} || '')
+    } @$objects;
+    
+    # Affichage
+    printf "%-50s %-12s %-20s %s\n", 
+           "Backup Name", "Size", "Date", "VMID";
+    print "-" x 100 . "\n";
+    
+    foreach my $object (@$objects) {
+        my $key = $object->{Key};
+        my $name = basename($key);
+        my $size = format_bytes($object->{Size} || 0);
+        my $date = format_date($object->{LastModified});
+        
+        # Extraction du VMID
+        my $vmid = 'N/A';
+        if ($name =~ /vzdump-\w+-(\d+)-/) {
+            $vmid = $1;
+        }
+        
+        printf "%-50s %-12s %-20s %s\n", $name, $size, $date, $vmid;
+    }
+    
+    print "\nTotal: " . scalar(@$objects) . " backup(s)\n";
+}
+
+# Affichage des informations détaillées d'un backup
+sub show_backup_info {
+    my ($s3_client, $storage_config) = @_;
+    
+    my $key = resolve_backup_key($options{source}, $storage_config);
+    
+    log_info("Getting backup information: $key") if $options{verbose};
+    
+    # Récupération des métadonnées
+    my $metadata = $s3_client->head_object($storage_config->{bucket}, $key);
+    
+    print "Backup Information\n";
+    print "==================\n\n";
+    print "Key: $key\n";
+    print "Bucket: $storage_config->{bucket}\n";
+    print "Size: " . format_bytes($metadata->{ContentLength} || 0) . "\n";
+    print "Last Modified: " . format_date($metadata->{LastModified}) . "\n";
+    print "ETag: " . ($metadata->{ETag} || 'N/A') . "\n";
+    
+    # Métadonnées Proxmox
+    print "\nProxmox Metadata\n";
+    print "================\n";
+    
+    foreach my $header (sort keys %$metadata) {
+        if ($header =~ /^x-amz-meta-(.+)$/) {
+            my $meta_name = $1;
+            $meta_name =~ s/^x-pve-//;  # Simplifie l'affichage
+            printf "%-20s: %s\n", ucfirst($meta_name), $metadata->{$header};
+        }
+    }
+    
+    # Vérification d'intégrité si demandée
+    if ($options{verify}) {
+        print "\nIntegrity Check\n";
+        print "===============\n";
+        verify_backup_integrity($s3_client, $storage_config, $key);
+    }
+}
+
+# Restauration d'un backup
+sub restore_backup {
+    my ($s3_client, $storage_config) = @_;
+    
+    my $source_key = resolve_backup_key($options{source}, $storage_config);
+    my $destination = $options{destination};
+    
+    # Vérification de la destination
+    if (-e $destination && !$options{force}) {
+        die "Error: Destination '$destination' already exists (use --force to overwrite)\n";
+    }
+    
+    # Création du répertoire de destination si nécessaire
+    my $dest_dir = dirname($destination);
+    make_path($dest_dir) if $dest_dir && !-d $dest_dir;
+    
+    log_info("Starting restore: s3://$storage_config->{bucket}/$source_key -> $destination");
+    
+    print "Restoring backup...\n";
+    print "  Source: s3://$storage_config->{bucket}/$source_key\n";
+    print "  Destination: $destination\n";
+    
+    # Récupération de la taille du backup
+    my $metadata = $s3_client->head_object($storage_config->{bucket}, $source_key);
+    my $file_size = $metadata->{ContentLength} || 0;
+    print "  Size: " . format_bytes($file_size) . "\n";
+    
+    # Téléchargement
+    my $result = $s3_client->download_file(
+        $storage_config->{bucket},
+        $source_key,
+        $destination
+    );
+    
+    # Vérification du résultat
+    my $downloaded_size = -s $destination;
+    if ($downloaded_size != $file_size) {
+        die "Error: Size mismatch after download (expected: $file_size, got: $downloaded_size)\n";
+    }
+    
+    print "\nRestore completed successfully!\n";
+    print "  Duration: " . sprintf("%.2f", $result->{duration}) . "s\n";
+    print "  Throughput: " . sprintf("%.2f", $result->{throughput}) . " MB/s\n" if $result->{throughput};
+    print "  Operation ID: $result->{operation_id}\n" if $options{verbose};
+}
+
+# Résolution du nom/clé de backup
+sub resolve_backup_key {
+    my ($source, $storage_config) = @_;
+    
+    my $prefix = ($storage_config->{prefix} || 'proxmox/') . 'backup/';
+    
+    # Si c'est déjà une clé complète, on la retourne
+    if ($source =~ /^backup\//) {
+        return $source;
+    }
+    
+    # Si c'est juste un nom de fichier, on ajoute le préfixe
+    if ($source !~ /\//) {
+        return $prefix . $source;
+    }
+    
+    # Sinon, on considère que c'est une clé relative
+    return $source;
+}
+
+# Vérification d'intégrité d'un backup
+sub verify_backup_integrity {
+    my ($s3_client, $storage_config, $key) = @_;
+    
+    # Ici on pourrait implémenter diverses vérifications :
+    # - Vérification du checksum si disponible dans les métadonnées
+    # - Test de lecture des premiers/derniers blocs
+    # - Validation du format de fichier
+    
+    print "Basic connectivity test: ";
+    eval {
+        my $metadata = $s3_client->head_object($storage_config->{bucket}, $key);
+        print "OK\n";
+        
+        # Test de lecture partielle
+        print "Partial read test: ";
+        my $sample = $s3_client->get_object_range($storage_config->{bucket}, $key, 0, 1023);
+        if (length($sample) > 0) {
+            print "OK (read " . length($sample) . " bytes)\n";
+        } else {
+            print "WARNING (empty response)\n";
+        }
+    };
+    if ($@) {
+        print "FAILED ($@)\n";
+    }
+}
+
+# Formatage d'une date
+sub format_date {
+    my ($date_str) = @_;
+    
+    return 'N/A' if !$date_str;
+    
+    # Parse format ISO 8601
+    if ($date_str =~ /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/) {
+        return "$1-$2-$3 $4:$5:$6";
+    }
+    
+    return $date_str;
+}
+
+# Chargement de la configuration du storage (même fonction que dans pve-s3-backup)
+sub load_storage_config {
+    my ($storage_id) = @_;
+    
+    my $config = {
+        type => 's3',
+        endpoint => $ENV{S3_ENDPOINT} || 's3.amazonaws.com',
+        bucket => $ENV{S3_BUCKET} || die "S3_BUCKET environment variable required\n",
+        region => $ENV{S3_REGION} || 'us-east-1',
+        access_key => $ENV{S3_ACCESS_KEY} || die "S3_ACCESS_KEY environment variable required\n",
+        secret_key => $ENV{S3_SECRET_KEY} || die "S3_SECRET_KEY environment variable required\n",
+        prefix => $ENV{S3_PREFIX} || 'proxmox/',
+    };
+    
+    log_info("Loaded storage configuration for '$storage_id'") if $options{verbose};
+    
+    return $config;
+}
+
+# Création du client S3 (même fonction que dans pve-s3-backup)
+sub create_s3_client {
+    my ($storage_config) = @_;
+    
+    my $config = PVE::Storage::S3::Config->new($storage_config);
+    my $auth = PVE::Storage::S3::Auth->new($storage_config);
+    
+    return PVE::Storage::S3::Client->new($config, $auth);
+}
+
+# Point d'entrée principal
+main();
+
+__END__
+
+=head1 NAME
+
+pve-s3-restore - Restore files from S3 storage for Proxmox VE
+
+=head1 SYNOPSIS
+
+pve-s3-restore [OPTIONS]
+
+=head1 DESCRIPTION
+
+This script provides a command-line interface for restoring files from S3-compatible
+storage systems to Proxmox VE. It can list available backups, show detailed information,
+and restore files efficiently with progress tracking.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--storage, -s> I<STORAGE_ID>
+
+ID of the S3 storage configuration to use (required).
+
+=item B<--list, -l>
+
+List available backups in the storage.
+
+=item B<--info, -i>
+
+Show detailed information about a specific backup (requires --source).
+
+=item B<--source> I<BACKUP_NAME>
+
+Name or key of the backup to restore or show info about.
+
+=item B<--destination, -d> I<FILE>
+
+Path where to restore the backup (required for restore operations).
+
+=item B<--vmid> I<VMID>
+
+Filter backups by virtual machine ID (for --list).
+
+=item B<--verify>
+
+Perform integrity checks on the backup (use with --info).
+
+=item B<--force, -f>
+
+Overwrite destination file if it already exists.
+
+=item B<--config, -c> I<FILE>
+
+Path to Proxmox storage configuration file (default: /etc/pve/storage.cfg).
+
+=item B<--verbose, -v>
+
+Enable verbose output.
+
+=item B<--help, -h>
+
+Show this help message.
+
+=item B<--version, -V>
+
+Show version information.
+
+=back
+
+=head1 ENVIRONMENT
+
+Same environment variables as pve-s3-backup(1).
+
+=head1 EXAMPLES
+
+List all available backups:
+
+  pve-s3-restore --storage s3-storage --list
+
+List backups for a specific VM:
+
+  pve-s3-restore --storage s3-storage --list --vmid 100
+
+Show information about a backup:
+
+  pve-s3-restore --storage s3-storage --info --source vzdump-qemu-100-2023_12_25-14_30_00.vma.gz
+
+Restore a backup:
+
+  pve-s3-restore --storage s3-storage --source vzdump-qemu-100-2023_12_25-14_30_00.vma.gz --destination /tmp/restored-backup.vma.gz
+
+Restore with integrity verification:
+
+  pve-s3-restore --storage s3-storage --info --source backup.tar --verify
+
+=head1 EXIT STATUS
+
+Same as pve-s3-backup(1).
+
+=head1 SEE ALSO
+
+pve-s3-backup(1), pve-s3-maintenance(1)
+
+=head1 AUTHOR
+
+Proxmox S3 Plugin Team
+
+=cut

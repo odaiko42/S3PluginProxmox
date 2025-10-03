@@ -1,0 +1,138 @@
+
+Storage Plugin Development
+Jump to navigationJump to search
+Proxmox VE has a generic storage plugin system; in addition to the natively included plugins, there's also a mechanism for loading external third-party plugins.
+
+This wiki provides some basic documentation on how to develop plugins and important rules to follow when doing so.
+
+
+Contents
+1	Licensing
+2	Plugin Architecture
+2.1	Language Support
+2.2	Loading Path
+2.3	API Versioning
+2.4	API
+3	Integration Testing
+4	Examples
+4.1	Official Examples
+4.2	Third-Party Examples
+5	Support and Help
+Licensing
+Your storage plugin code will be loaded by the AGPLv3+ licensed Proxmox VE system and therefore needs to be licensed to allow this.
+
+Note that this only affects the plugin code itself, not the source code of your actual storage system. To interface with proprietary code, you can, for example, run external binaries, use a (public) network API (such as over HTTP), or use a separate client library released under an AGPLv3+-compatible license.
+
+It's strongly recommended that you use one of the following three licenses for the plugin code, in order of preference:
+
+AGPL-3.0-or-later
+GPL-3.0-or-later
+MIT OR Apache-2.0
+Proxmox Server Solutions GmbH reserves the right to take legal action and/or actively break any external plugin if it is licensed under a proprietary license or one that does not comply with being combined into an AGPLv3+ project.
+
+Plugin Architecture
+Language Support
+Plugins are Perl modules. Note that you can also create Perl bindings for other language, like through Perl XS for C FFI/libraries or the Proxmox perlmod crate for rust based projects.
+
+Loading Path
+External Plugins are loaded from /usr/share/perl5/PVE/Storage/Custom/YourCustomPlugin.pm, and thus they must have a Perl package declaration like package PVE::Storage::Custom::YourCustomPlugin;
+
+We recommend that you release your storage plugin for Proxmox VE as Debian package. Doing so nicely integrates with how Proxmox VE is updated including declaring version dependencies or constraints with other packages.
+
+API Versioning
+The storage plugin system uses its own versioning for API backward compatibility, which is decoupled from the main Proxmox VE version, and the public REST API of Proxmox VE.
+
+The storage plugin's API versioning system is based consists of an APIVER and an APIAGE.
+
+The APIVER is always bumped when the plugin API is changed, e.g., adding new methods, removing deprecated ones or expanding or changing the signature of an existing method.
+The APIAGE is the number of versions we're backward compatible with, in other words, things (methods or params) got added without breaking anything unaware of it. This is often done by providing a default implementation, or value, that matches the previous behavior.
+For an example implementation that can handle API versioning with broad compatibility see here.
+
+The API version changelog is tracked in the pve-storage git repository: https://git.proxmox.com/?p=pve-storage.git;a=blob;f=ApiChangeLog
+
+API
+In general, it's highly recommended to base your plugin of an included plugin, if unsure use the base plugin or the one your storage has the most similarities with.
+
+For example through:
+
+use base qw(PVE::Storage::Plugin);
+All (included) plugins are basing of the Proxmox SectionConfig module. If you decide to roll your own base for your plugin you need to ensure manually that you're compatible with the SectionConfig API.
+
+You must at least implement the following sub-methods:
+
+api - return the APIVER version your plugin supports.
+type - returns the storage section config string type that identifies your storage type.
+plugindata - returns an object with metadata about what content types, formats and defaults your storage plugin supports.
+properties - returns a schema of (additional) properties that your plugin needs or wants to support as configuration.
+option - returns a schema of the options that your plugin understands, with specifying if they are optional or not. Note that the properties of all other plugins are available for use too.
+Then implement any sub-method with a $class as first argument from the base-plugin for which you need a storage-specific behavior.
+
+Note: This section should be expanded, for now see the examples below and checkout the existing included plugins and the section config source.
+
+Integration Testing
+Currently, we recommend end-to-end testing by installing your plugin on an up-to-date Proxmox VE system and performing at least the following tasks
+
+Add a new storage entry for your custom plugin.
+Create at least one virtual machine (VM) and one container (CT) using the default configuration suggested by the guest creation wizard in the Proxmox VE management web UI.
+Add a new disc volume to the Guests supported by your custom storage plugin.
+Use that additional disk to run a IO benchmark tool like fio or CrystalDiskMark inside the virtual guest and ensure it outputs adequate performance.
+For virtual machines you also should try other disk bus types than the default, e.g., VirtIO-Blk, SCSI (both VirtIO and LSI based) and potentially SATA/IDE for compatibility reasons.
+Depending on the capabilities of your storage you should also try to:
+Clone the disk.
+Create a snapshot and rollback and/or clone the VM using that snapshot.
+Create a backup (for file based or custom backup function).
+Download a container template from our registry and download a ISO directly to the storage.
+Purge a disk, e.g. by detaching it from a guest and then removing the unused disk entry.
+Migrate both, a VM and a CT to another node. For the VM test both an online migration (VM is running) and an offline migration (VM is stopped).
+Repeat the VM online live-migration with running the IO benchmark tool inside to generate IO load during migration.
+We're currently in the process of further improving the plugin developer experience, and as part of this we plan to create a small test suite to help ensure compliance with the API and interaction with the plugin system. However, this will never replace end-to-end testing, and we strongly recommend that you run a QA test on every major release of Proxmox VE, and ideally on every minor point release of Proxmox VE.
+
+Examples
+Official Examples
+We currently provide a git repository hosting some examples, focusing on the backup provider API but with plans to extend for storage access in the future. See https://git.proxmox.com/?p=pve-storage-plugin-examples.git;a=summary
+
+See also the accompanying Writing a Storage Plugin for SSHFS wiki article.
+
+Third-Party Examples
+For some examples of real-world third party storage plugins see the following links:
+
+https://github.com/LINBIT/linstor-proxmox/blob/master/LINSTORPlugin.pm
+
+https://github.com/storpool/pve-storpool/blob/main/lib/PVE/Storage/Custom/StorPoolPlugin.pm
+
+Support and Help
+While Proxmox does not offer paid support or even development work for creating external storage plugins, you can ask any development related question on our mailing list.
+
+Please ask specific questions and provide your (work in progress) code, ideally as git repository.
+
+Categories: DevelopmentStorage
+Cookies help us deliver our services. By using our services, you agree to our use of cookies.
+Navigation menu
+Log in
+PageDiscussion
+ReadView sourceView history
+Search
+Search Proxmox VE
+Proxmox VE
+Documentation (current)
+Documentation (8.x)
+Downloads
+Installation
+Get support
+Sites
+proxmox.com
+Support forum
+Bugtracker
+Source code
+FAQ
+Tools
+What links here
+Related changes
+Special pages
+Printable version
+Permanent link
+Page information
+Cite this page
+This page was last edited on 8 September 2025, at 10:40.
+Privacy policyAbout Proxmox VEDisclaimers
+Powered by MediaWiki

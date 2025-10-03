@@ -1,0 +1,49 @@
+# COMMANDES DE VÉRIFICATION RAPIDE
+# Copiez-collez ces commandes une par une dans votre SSH Proxmox
+
+echo "=== VÉRIFICATION PLUGIN S3 PROXMOX ==="
+
+# 1. Vérifier le fichier principal du plugin
+echo -e "\n1️⃣ Plugin principal:"
+ls -la /usr/share/perl5/PVE/Storage/S3Plugin.pm 2>/dev/null && echo "✅ Plugin trouvé" || echo "❌ Plugin MANQUANT - Il faut l'installer!"
+
+# 2. Vérifier le répertoire des modules S3
+echo -e "\n2️⃣ Modules S3:"
+ls -la /usr/share/perl5/PVE/Storage/S3/ 2>/dev/null | wc -l | xargs -I {} echo "Modules trouvés: {}"
+
+# 3. Vérifier les scripts en ligne de commande
+echo -e "\n3️⃣ Scripts CLI:"
+ls -la /usr/local/bin/pve-s3-* 2>/dev/null | wc -l | xargs -I {} echo "Scripts trouvés: {}"
+
+# 4. Vérifier la configuration S3
+echo -e "\n4️⃣ Configuration:"
+grep -c "^s3:" /etc/pve/storage.cfg 2>/dev/null | xargs -I {} echo "Configurations S3: {}"
+
+# 5. Test syntaxe Perl (si fichier existe)
+echo -e "\n5️⃣ Syntaxe Perl:"
+[ -f "/usr/share/perl5/PVE/Storage/S3Plugin.pm" ] && perl -c /usr/share/perl5/PVE/Storage/S3Plugin.pm || echo "Fichier absent"
+
+# 6. Services Proxmox
+echo -e "\n6️⃣ Services:"
+systemctl is-active pvedaemon | xargs -I {} echo "pvedaemon: {}"
+systemctl is-active pveproxy | xargs -I {} echo "pveproxy: {}"
+
+# 7. Test gestionnaire de stockage
+echo -e "\n7️⃣ Gestionnaire stockage:"
+pvesm status >/dev/null 2>&1 && echo "pvesm: ✅ Fonctionne" || echo "pvesm: ❌ Erreur"
+
+# RÉSULTAT ATTENDU SI PLUGIN INSTALLÉ:
+# ✅ Plugin trouvé
+# Modules trouvés: 8+ (fichiers .pm)
+# Scripts trouvés: 3 (pve-s3-backup, restore, maintenance)
+# Configurations S3: 1+ 
+# Syntaxe: syntax OK
+# pvedaemon: active
+# pveproxy: active  
+# pvesm: ✅ Fonctionne
+
+echo -e "\n=== INTERPRÉTATION ==="
+echo "Si 'Plugin MANQUANT' → Le plugin n'a jamais été installé"
+echo "Si 'Modules trouvés: 0' → Installation incomplète" 
+echo "Si 'Configurations S3: 0' → Pas de stockage S3 configuré"
+echo "Si services 'inactive' → Redémarrer avec: systemctl restart pvedaemon pveproxy"
